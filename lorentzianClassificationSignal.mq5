@@ -587,10 +587,10 @@ int OnCalculate(const int rates_total, const int prev_calculated, const datetime
             isNewBuySignal = isBuySignal && isDifferentSignalType;
             isNewSellSignal = isSellSignal && isDifferentSignalType;
 
-            // isBullish = useKernelFilter ? (useKernelSmoothing ? isBullishSmooth : isBullishRate) : true;
-            // isBearish = useKernelFilter ? (useKernelSmoothing ? isBearishSmooth : isBearishRate) : true;
-            isBullish = true;
-            isBearish = true;
+            isBullish = useKernelFilter ? (useKernelSmoothing ? isBullishSmooth : isBullishRate) : true;
+            isBearish = useKernelFilter ? (useKernelSmoothing ? isBearishSmooth : isBearishRate) : true;
+            // isBullish = true;
+            // isBearish = true;
 
             // Entry Conditions: Booleans for ML Model Position Entries
             startLongTrade = isNewBuySignal && isBullish && isEmaUptrend[ArraySize(isEmaUptrend) - 1] && isSmaUptrend[ArraySize(isSmaUptrend) - 1];
