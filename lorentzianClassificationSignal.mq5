@@ -1,33 +1,61 @@
 //------------------------------------------------------------------
+#property copyright "Juan Calvo Pozo, 2023"
 #property link "juandelacruz.calvo@gmail.com"
 //------------------------------------------------------------------
 
-#include <movingaverages.mqh>
+// Info
+
+// f2WT sometimes is 0 because it is the new minimal and changes the boundaries of the normalisation
+
+// TODO
+
+// Check why predictions numbers don't match, suspect that the process to
+// calculate the predictions is not correct
+// The distance of the 4th feature is lower than expected
+// Both RSI are good but they are always 1 bar late where as in othe original it is on time
+// The rest of the features are not calculated correctly
+// The predictions are not calculated correctly
+
+// !!!!
+// The reason for being lagged 1 bar is that TV calculates at close and we calculate at open,
+// so in our logs shows the time of next bar
+
+// WT is perfectly aligned but the rest of the features 1 bar late
+
+// Double check on the features, ADX Wilder works fine, double check CCI and WT
+//
+#include <Juande/lorentzianClassification/movingaverages.mqh>
 
 #property indicator_chart_window
-#property indicator_buffers 2
-#property indicator_plots 1
+#property indicator_buffers 3
+#property indicator_plots 2
 
 #property indicator_label1 "Trades"
 #property indicator_type1 DRAW_COLOR_ARROW
 #property indicator_color1 clrLimeGreen, clrRed
 #property indicator_width1 2
 
-#property indicator_label2 "Regime Filter"
-#property indicator_type2 DRAW_ARROW
-#property indicator_color2 clrBlue
-#property indicator_width2 2
+#property indicator_label2 "Signal"
+#property indicator_type2 DRAW_NONE
 
-#property indicator_label3 "Volatility Filter"
-#property indicator_type3 DRAW_ARROW
-#property indicator_color3 clrOrange
-#property indicator_width3 2
+// #property indicator_label2 "f1"
+// #property indicator_type2 DRAW_ARROW
+// #property indicator_color2 clrBlue
+// #property indicator_width2 2
 
-#property indicator_label4 "Predictions"
-#property indicator_type4 DRAW_NONE
+// #property indicator_label3 "f2"
+// #property indicator_type3 DRAW_ARROW
+// #property indicator_color3 clrOrange
+// #property indicator_width3 2
 
-#property indicator_label5 "Last Distances"
-#property indicator_type5 DRAW_NONE
+// #property indicator_label4 "f3"
+// #property indicator_type4 DRAW_NONE
+
+// #property indicator_label5 "f4"
+// #property indicator_type5 DRAW_NONE
+
+// #property indicator_label6 "f5"
+// #property indicator_type6 DRAW_NONE
 
 //
 //--- input parameters
@@ -66,7 +94,7 @@ input bool useWorstCase = false; // Whether to use worst-case estimates for back
 input bool useVolatilityFilter = true; // Whether to use the volatility filter.
 
 input bool useRegimeFilter = true; // Whether to use the regime filter. ESTO DEBE ESTAR TRUE
-input bool useAdxFilter = false;    // Whether to use the ADX filter.
+input bool useAdxFilter = false;   // Whether to use the ADX filter.
 
 // Regime Filter
 input double regimeFilterThreshold = -0.1; // Threshold for detecting Trending/Ranging markets.
@@ -80,7 +108,7 @@ input int rsi1EmaPeriod = 1; // First EMA RSI period
 
 input int wtPeriod1 = 10; // The primary parameter of feature 2.
 input int wtPeriod2 = 11; // The secondary parameter of feature 2 (if applicable).
- 
+
 input int cciPeriod = 20;   // CCI Period
 input int cciEmaPeriod = 1; // CCI EMA Period
 
@@ -179,12 +207,12 @@ double smoothDirectionalMovementPlus[2];
 double smoothnegMovement[2];
 
 double trades[];
-// double realTrades[];
+double realTrades[];
 double tradeColors[];
-// double lastDistances[]; // Distances
+double lastDistances[]; // Distances
 // double regimeBuffer[];
 // double volatilityBuffer[];
-// double predictionsBuffer[];
+double predictionsBuffer[];
 
 // ML model
 double predictions[];
@@ -218,6 +246,7 @@ bool startLongTrade;
 bool startShortTrade;
 
 double lastDistance = -1.0;
+int lastDistanceIndex = 0;
 int y_train_array_size;
 int sizeLoop;
 int size;
@@ -229,6 +258,8 @@ bool filter_all = false;
 
 int highestPeriodConfigured = 0;
 
+int initialBar = -1;
+
 //+------------------------------------------------------------------+
 //| Custom indicator initialization function                         |
 //+------------------------------------------------------------------+
@@ -238,12 +269,11 @@ int OnInit()
     SetIndexBuffer(0, trades, INDICATOR_DATA);
 
     SetIndexBuffer(1, tradeColors, INDICATOR_COLOR_INDEX);
-    // SetIndexBuffer(2, regimeBuffer, INDICATOR_DATA);
-    // SetIndexBuffer(3, volatilityBuffer, INDICATOR_DATA);
-    // SetIndexBuffer(4, predictionsBuffer, INDICATOR_DATA);
-    // SetIndexBuffer(5, lastDistances, INDICATOR_DATA);
-    // SetIndexBuffer(6, realTrades, INDICATOR_CALCULATIONS);
-
+    SetIndexBuffer(2, realTrades, INDICATOR_DATA);
+    // SetIndexBuffer(3, f2WT, INDICATOR_DATA);
+    // SetIndexBuffer(4, f3Cci, INDICATOR_DATA);
+    // SetIndexBuffer(5, f4Adx, INDICATOR_DATA);
+    // SetIndexBuffer(6, f5Rsi, INDICATOR_DATA);
 
     highestPeriodConfigured = MathMax(rsi1Period, MathMax(rsi2Period, MathMax(cciPeriod, MathMax(adxPeriod, MathMax(wtPeriod1, MathMax(wtPeriod2, MathMax(emaPeriod, smaPeriod)))))));
     // Do not calculate the indicator for the highest period
@@ -286,6 +316,14 @@ int OnInit()
     ArrayInitialize(wtCi, 0);
     ArrayInitialize(wt1, 0);
     ArrayInitialize(wt1MinusWt2, 0);
+    // To avoid issues with the initial values
+    ArrayInitialize(bufferCci, 0);
+    ArrayInitialize(firstBufferRsi, 0);
+    ArrayInitialize(secondBufferRsi, 0);
+    ArrayInitialize(bufferAdx, 0);
+
+    ArrayResize(predictions, neighborsCount + 1);
+    ArrayResize(distances, neighborsCount + 1);
 
     return (INIT_SUCCEEDED);
 }
@@ -319,9 +357,16 @@ int OnCalculate(const int rates_total, const int prev_calculated, const datetime
 {
 
     // Only calculate per new bar
-    // if (prev_calculated == rates_total)
+    if (prev_calculated == rates_total)
+    {
+        return (rates_total);
+    }
+
+    int updated_prev_calculated = prev_calculated;
+    // if prev_calculcated - rates_total > 2200 then only calculate the last 2000
+    // if (prev_calculated - rates_total > 2200)
     // {
-    //     return (rates_total);
+    //     updated_prev_calculated = rates_total - 2200;
     // }
 
     // ArrayResize(firstEmaRsi, rates_total);
@@ -334,7 +379,7 @@ int OnCalculate(const int rates_total, const int prev_calculated, const datetime
     ArrayResize(adxEmaBuffer, rates_total);
 
     ArrayResize(y_train_array, rates_total);
-   // ArrayResize(lastDistances, rates_total);
+    // ArrayResize(lastDistances, rates_total);
 
     ArrayResize(hlc3, rates_total);
     ArrayResize(wtAbsMinusSource, rates_total);
@@ -343,74 +388,76 @@ int OnCalculate(const int rates_total, const int prev_calculated, const datetime
     ArrayResize(wt1, rates_total);
     ArrayResize(wt1MinusWt2, rates_total);
     ArrayResize(f2WT, rates_total);
+    ArrayResize(predictionsBuffer, rates_total);
 
     ArrayResize(ohlc4, rates_total);
-    //ArrayResize(realTrades, rates_total);
+    // ArrayResize(realTrades, rates_total);
 
     if (Bars(_Symbol, _Period) < rates_total)
-        return (prev_calculated);
+        return (updated_prev_calculated);
 
-    if (!fillArrayFromBuffer(recentAtrBuffer, hATRPeriod1, 0, 0, MathMax(rates_total - prev_calculated, 2)))
+    if (!fillArrayFromBuffer(recentAtrBuffer, hATRPeriod1, 0, 0, MathMax(rates_total - updated_prev_calculated, 2)))
     {
         Print("Error filling array from buffer");
     }
-    if (!fillArrayFromBuffer(historicalAtrBuffer, hATRPeriod10, 0, 0, MathMax(rates_total - prev_calculated, 2)))
-    {
-        Print("Error filling array from buffer");
-    }
-
-    if (!fillArrayFromBuffer(emaFilterBuffer, hEmaFilter, 0, 0, MathMax(rates_total - prev_calculated, 2)))
+    if (!fillArrayFromBuffer(historicalAtrBuffer, hATRPeriod10, 0, 0, MathMax(rates_total - updated_prev_calculated, 2)))
     {
         Print("Error filling array from buffer");
     }
 
-    if (!fillArrayFromBuffer(smaFilterBuffer, hSmaFilter, 0, 0, MathMax(rates_total - prev_calculated, 2)))
+    // if (!fillArrayFromBuffer(emaFilterBuffer, hEmaFilter, 0, 0, MathMax(rates_total - updated_prev_calculated, 2)))
+    // {
+    //     Print("Error filling array from buffer");
+    // }
+
+    // if (!fillArrayFromBuffer(smaFilterBuffer, hSmaFilter, 0, 0, MathMax(rates_total - updated_prev_calculated, 2)))
+    // {
+    //     Print("Error filling array from buffer");
+    // }
+
+    if (!fillArrayFromBuffer(firstBufferRsi, hFirstRSI, 0, 0, MathMax(rates_total - updated_prev_calculated, 2)))
     {
         Print("Error filling array from buffer");
     }
 
-    if (!fillArrayFromBuffer(firstBufferRsi, hFirstRSI, 0, 0, MathMax(rates_total - prev_calculated, 2)))
+    overrideFirstBuffer(firstBufferRsi, rsi1Period, updated_prev_calculated);
+
+    if (!fillArrayFromBuffer(secondBufferRsi, hSecondRSI, 0, 0, MathMax(rates_total - updated_prev_calculated, 2)))
     {
         Print("Error filling array from buffer");
     }
 
-    overrideFirstBuffer(firstBufferRsi, rsi1Period, prev_calculated);
+    overrideFirstBuffer(secondBufferRsi, rsi2Period, updated_prev_calculated);
 
-    if (!fillArrayFromBuffer(secondBufferRsi, hSecondRSI, 0, 0, MathMax(rates_total - prev_calculated, 2)))
+    if (!fillArrayFromBuffer(bufferAdx, hAdxFeature, 0, 0, MathMax(rates_total - updated_prev_calculated, 2)))
+    {
+        Print("Error filling array from buffer");
+    }
+    overrideFirstBuffer(bufferAdx, adxPeriod, updated_prev_calculated);
+
+    if (!fillArrayFromBuffer(bufferCci, hCci, 0, 0, MathMax(rates_total - updated_prev_calculated, 2)))
     {
         Print("Error filling array from buffer");
     }
 
-    overrideFirstBuffer(secondBufferRsi, rsi2Period, prev_calculated);
-
-    if (!fillArrayFromBuffer(bufferAdx, hAdxFeature, 0, 0, MathMax(rates_total - prev_calculated, 2)))
-    {
-        Print("Error filling array from buffer");
-    }
-    overrideFirstBuffer(bufferAdx, adxPeriod, prev_calculated);
-
-    if (!fillArrayFromBuffer(bufferCci, hCci, 0, 0, MathMax(rates_total - prev_calculated, 2)))
-    {
-        Print("Error filling array from buffer");
-    }
-
-    overrideFirstBuffer(bufferCci, cciPeriod, prev_calculated);
+    overrideFirstBuffer(bufferCci, cciPeriod, updated_prev_calculated);
 
     // EMA for WT
-    if (!fillArrayFromBuffer(wtEma1, hEmaWT, 0, 0, MathMax(rates_total - prev_calculated, 2)))
+    if (!fillArrayFromBuffer(wtEma1, hEmaWT, 0, 0, MathMax(rates_total - updated_prev_calculated, 2)))
     {
         Print("Error filling array from buffer");
     }
-    // Prepare RSI features
-    // TODO: Check if 0 is the correct value for the prev_calculated parameter
-    // ExponentialMAOnBuffer(rates_total, prev_calculated, 0, rsi1EmaPeriod, firstBufferRsi, firstEmaRsi, prev_calculated != 0);
-    rescaleArray(rates_total, prev_calculated, 0, 100, 0, 1, firstBufferRsi, f1Rsi);
 
-    // ExponentialMAOnBuffer(rates_total, prev_calculated, 0, rsi2EmaPeriod, secondBufferRsi, secondEmaRsi, prev_calculated != 0);
-    rescaleArray(rates_total, prev_calculated, 0, 100, 0, 1, secondBufferRsi, f5Rsi);
+    // Prepare RSI features
+    // TODO: Check if 0 is the correct value for the updated_prev_calculated parameter
+    // ExponentialMAOnBuffer(rates_total, updated_prev_calculated, 0, rsi1EmaPeriod, firstBufferRsi, firstEmaRsi, updated_prev_calculated != 0);
+    rescaleArray(rates_total, updated_prev_calculated, 0, 100, 0, 1, firstBufferRsi, f1Rsi);
+
+    // ExponentialMAOnBuffer(rates_total, updated_prev_calculated, 0, rsi2EmaPeriod, secondBufferRsi, secondEmaRsi, updated_prev_calculated != 0);
+    rescaleArray(rates_total, updated_prev_calculated, 0, 100, 0, 1, secondBufferRsi, f5Rsi);
 
     // Prepare CCI feature
-    // ExponentialMAOnBuffer(rates_total, prev_calculated, 0, cciEmaPeriod, bufferCci, cciEmaBuffer, prev_calculated != 0);
+    // ExponentialMAOnBuffer(rates_total, updated_prev_calculated, 0, cciEmaPeriod, bufferCci, cciEmaBuffer, updated_prev_calculated != 0);
 
     for (int i = 0; i < ArraySize(bufferCci); i++)
     {
@@ -418,29 +465,37 @@ int OnCalculate(const int rates_total, const int prev_calculated, const datetime
         _historicMaxCCi = MathMax(bufferCci[i], _historicMaxCCi);
     }
 
-    rescaleArray(rates_total, prev_calculated, _historicMinCCi, _historicMaxCCi, 0, 1, bufferCci, f3Cci);
+    rescaleArray(rates_total, updated_prev_calculated, _historicMinCCi, _historicMaxCCi, 0, 1, bufferCci, f3Cci);
 
     // Prepare ADX
-    ExponentialMAOnBuffer(rates_total, prev_calculated, 0, adxEmaPeriod, bufferAdx, adxEmaBuffer);
-    rescaleArray(rates_total, prev_calculated, 0, 100, 0, 1, adxEmaBuffer, f4Adx);
+    ExponentialMAOnBuffer(rates_total, updated_prev_calculated, 0, adxEmaPeriod, bufferAdx, adxEmaBuffer);
+    rescaleArray(rates_total, updated_prev_calculated, 0, 100, 0, 1, adxEmaBuffer, f4Adx, true);
     // The last bar pending to calculate is always the current bar, on it high, low and close are the same since it at beginning of the bar
     // The last bar should probably not be used to feed the ML model
 
     // Only calculate last maxBarsBack
-    int firstBar = MathMax(prev_calculated - 1, 0);
-    if (prev_calculated == 0)
+
+    // When running on ticks, the last bar is temporary, since the bar didn't close, the calculation of the last bar keeps being updated
+    // as a consequence, we always recalculate the previous bar to make sure that we end up setting the final values of indicators
+    // once the last bar has closed.
+    int firstBar = MathMax(updated_prev_calculated, 0);
+    if (updated_prev_calculated == 0)
     {
-        firstBar = rates_total > maxBarsBack ? rates_total - maxBarsBack - highestPeriodConfigured - 1 : 0;
+        firstBar = rates_total > maxBarsBack ? rates_total - maxBarsBack - highestPeriodConfigured : 0;
     }
 
-    for (int i = firstBar; i < rates_total - 1 && !IsStopped(); i++)
+    if (initialBar == -1)
+    {
+        initialBar = firstBar;
+    }
+    for (int i = firstBar; i < rates_total && !IsStopped(); i++)
     {
         // Print("Calculating Bar on time: ", time[i]);
         hlc3[i] = (high[i] + low[i] + close[i]) / 3;
         // Prepare WT
         if (i > 0)
         {
-            wtAbsMinusSource[i] = MathAbs(hlc3[i] - wtEma1[prev_calculated == 0 ? i : 0]);
+            wtAbsMinusSource[i] = MathAbs(hlc3[i] - wtEma1[updated_prev_calculated == 0 ? i : 0]);
             // if (wtAbsMinusSource[i] == 0)
             // {
             //     Print("para");
@@ -449,7 +504,7 @@ int OnCalculate(const int rates_total, const int prev_calculated, const datetime
             {
 
                 wtEma2[i] = ExponentialMA(i, wtPeriod1, i == 0 ? 0 : wtEma2[i - 1], wtAbsMinusSource);
-                wtCi[i] = (wtEma2[i] == 0 ? 0 : hlc3[i] - wtEma1[prev_calculated == 0 ? i : 0]) / (0.015 * wtEma2[i]);
+                wtCi[i] = (wtEma2[i] == 0 ? 0 : hlc3[i] - wtEma1[updated_prev_calculated == 0 ? i : 0]) / (0.015 * wtEma2[i]);
                 if (i > 2)
                 {
                     wt1[i] = ExponentialMA(i, wtPeriod2, i == 0 ? 0 : wt1[i - 1], wtCi);
@@ -469,20 +524,20 @@ int OnCalculate(const int rates_total, const int prev_calculated, const datetime
         f2WT[i] = _historicMaxWt - _historicMinWt == 0 ? 0 : (wt1MinusWt2[i] - _historicMinWt) / (_historicMaxWt - _historicMinWt);
 
         // Print(StringFormat("hlc3: %.2f, ema: %.2f, wtAbsMinusSource: %.2f, wtEma2: %.2f, wtCi: %.2f, wt1: %.2f, wt2: %.2f, wt1MinusWt2: %.2f, f2WT: %.2f,",
-        //                   hlc3[i], wtEma1[prev_calculated == 0 ? i : 0], wtAbsMinusSource[i], wtEma2[i], wtCi[i], wt1[i], wt2, wt1MinusWt2[i], f2WT[i]));
+        //                   hlc3[i], wtEma1[updated_prev_calculated == 0 ? i : 0], wtAbsMinusSource[i], wtEma2[i], wtCi[i], wt1[i], wt2, wt1MinusWt2[i], f2WT[i]));
 
         // Filters
         ohlc4[i] = (high[i] + low[i] + close[i] + open[i]) / 4;
 
-        volatilityFilter = filter_volatility(recentAtrBuffer[prev_calculated == 0 ? i : 0], historicalAtrBuffer[prev_calculated == 0 ? i : 0], useVolatilityFilter);
+        volatilityFilter = filter_volatility(recentAtrBuffer[updated_prev_calculated == 0 ? i : 0], historicalAtrBuffer[updated_prev_calculated == 0 ? i : 0], useVolatilityFilter);
         regimeFilter = i > 0 ? regime_filter(ohlc4, high, low, i, regimeFilterThreshold, useRegimeFilter) : false;
         adxFilter = filter_adx(useAdxFilter);
 
-        // regimeBuffer[i] = regimeFilter ? low[i] - 0.1 : 0;
-        // volatilityBuffer[i] = volatilityFilter ? high[i] + 0.1 : 0;
+        // regimeBuffer[i] = regimeFilter ? low[i] - 0.5 : 0;
+        // volatilityBuffer[i] = volatilityFilter ? high[i] + 0.5 : 0;
 
-        filter_all = volatilityFilter && regimeFilter && adxFilter;
-        // filter_all = true;
+        // filter_all = volatilityFilter && regimeFilter && adxFilter;
+        filter_all = true;
 
         // if (filter_all)
         // {
@@ -496,61 +551,65 @@ int OnCalculate(const int rates_total, const int prev_calculated, const datetime
         ArrayResize(isSmaUptrend, ArraySize(isSmaUptrend) + 1);
         ArrayResize(isSmaDowntrend, ArraySize(isSmaDowntrend) + 1);
 
-        isEmaUptrend[ArraySize(isEmaUptrend) - 1] = (!useEmaFilter || close[i] > emaFilterBuffer[prev_calculated == 0 ? i : 0]);
-        isEmaDowntrend[ArraySize(isEmaDowntrend) - 1] = (!useEmaFilter || close[i] < emaFilterBuffer[prev_calculated == 0 ? i : 0]);
-        isSmaUptrend[ArraySize(isSmaUptrend) - 1] = (!useSmaFilter || close[i] > smaFilterBuffer[prev_calculated == 0 ? i : 0]);
-        isSmaDowntrend[ArraySize(isSmaDowntrend) - 1] = (!useSmaFilter || close[i] < smaFilterBuffer[prev_calculated == 0 ? i : 0]);
+        isEmaUptrend[ArraySize(isEmaUptrend) - 1] = (!useEmaFilter || close[i] > emaFilterBuffer[updated_prev_calculated == 0 ? i : 0]);
+        isEmaDowntrend[ArraySize(isEmaDowntrend) - 1] = (!useEmaFilter || close[i] < emaFilterBuffer[updated_prev_calculated == 0 ? i : 0]);
+        isSmaUptrend[ArraySize(isSmaUptrend) - 1] = (!useSmaFilter || close[i] > smaFilterBuffer[updated_prev_calculated == 0 ? i : 0]);
+        isSmaDowntrend[ArraySize(isSmaDowntrend) - 1] = (!useSmaFilter || close[i] < smaFilterBuffer[updated_prev_calculated == 0 ? i : 0]);
 
-        // This model specializes specifically in predicting the direction of price action over the course of the next 4 bars.
-        // To avoid complications with the ML model, this value is hardcoded to 4 bars but support for other training lengths may be added in the future.
-        if (i > 4)
+        if (i > highestPeriodConfigured + maxBarsBack)
         {
-            y_train_series = close[i - 4] < close[i] ? -1 : close[i - 4] > close[i] ? 1
-                                                                                    : 0;
+            y_train_series = close[i - 4] < close[i] ? 1 : close[i - 4] > close[i] ? -1
+                                                                                   : 0;
             y_train_array[i] = y_train_series;
-
-            maxBarsBackIndex = rates_total >= maxBarsBack ? rates_total - maxBarsBack : 0;
 
             size = MathMin(maxBarsBack - 1, ArraySize(y_train_array) - 1);
             sizeLoop = MathMin(maxBarsBack - 1, size);
 
-            // Size variable
-            int firstElementToCheck = maxBarsBackIndex > 0 ? maxBarsBackIndex - sizeLoop : 0;
+            maxBarsBackIndex = i - maxBarsBack;
 
-            // if (f3Cci[i] == 0) {
-            //    Print("para");
-            // }
+            // Print(StringFormat("Time: %s, Open: %.2f, Close: %.2f, Features: f1: %.2f, f2: %.2f, f3: %.2f, f4: %.2f, f5: %.2f", TimeToString(time[i]), open[i], close[i], f1Rsi[i], f2WT[i], f3Cci[i], f4Adx[i], f5Rsi[i]));
+            // Print(StringFormat("ADX: %.2f, ADX Ema: %.2f", bufferAdx[0], adxEmaBuffer[i]));
+            lastDistance = -1; // This is not required because the whole point of the array iteraction is to keep some of the nodes
+                               // This model specializes specifically in predicting the direction of price action over the course of the next 4 bars.
+                               // To avoid complications with the ML model, this value is hardcoded to 4 bars but support for other training lengths may be added in the future.
 
-            // Print(StringFormat("Open: %.2f, Close: %.2f, Features: f1: %.2f, f2: %.2f, f3: %.2f, f4: %.2f, f5: %.2f", open[i], close[i], f1Rsi[i], f2WT[i], f3Cci[i], f4Adx[i], f5Rsi[i]));
+            // MaxBarsBack Index doesn't fit with the same as in TV because MT5 starts buffering bars way earlier than TV
+            // Even if you set the time on the strategy tester, MT5 loads way more data, about 90k bars for example in Gold
+            
+            // Using a maxBarBack sliding window instead
+            int lastItemToCheck = maxBarsBackIndex + sizeLoop;
 
-            lastDistance = -1;
-
-            for (int j = firstElementToCheck; j < i; j++)
+            for (int j = maxBarsBackIndex; j < lastItemToCheck; j++)
             {
                 double d = get_lorentzian_distance(j, i, featureCount, f1Rsi, f2WT, f3Cci, f4Adx, f5Rsi);
-                if (d >= lastDistance && j % 4 == 0)
+                if (d >= lastDistance && j % 4 != 0)
                 {
                     lastDistance = d;
 
-                    // Add the distance and the prediction to the arrays at the end
-                    // TODO estos son arrays no series!!!
-                    ArrayResize(distances, ArraySize(distances) + 1);
-                    distances[ArraySize(distances) - 1] = d;
-                    ArrayResize(predictions, ArraySize(predictions) + 1);
-                    predictions[ArraySize(predictions) - 1] = y_train_array[i];
-
-                    if (ArraySize(predictions) > neighborsCount)
+                    distances[lastDistanceIndex] = d;
+                    predictions[lastDistanceIndex] = (int)MathRound(y_train_array[i]);
+                    lastDistanceIndex++;
+                    if (lastDistanceIndex > neighborsCount)
                     {
                         lastDistance = distances[(int)MathRound(neighborsCount * 3 / 4)];
-                        ArrayRemove(distances, 0, 1);
-                        ArrayRemove(predictions, 0, 1);
+                        removeFirstPosition(distances);
+                        removeFirstPosition(predictions);
+                        lastDistanceIndex--;
                     }
                 }
             }
 
-            //lastDistances[i] = lastDistance;
+            // lastDistances[i] = lastDistance;
             prediction = MathSum(predictions);
-            //predictionsBuffer[i] = prediction;
+
+            // lastDistances[i] = MathSum(distances);
+
+            string prediction_label = StringFormat("Prediction_%f", time[i]);
+            ObjectCreate(0, prediction_label, OBJ_TEXT, 0, time[i], prediction >= 0 ? high[i] + 4 : low[i] - 4);
+            ObjectSetString(0, prediction_label, OBJPROP_TEXT, IntegerToString(prediction));
+            ObjectSetInteger(0, prediction_label, OBJPROP_COLOR, clrWhite);
+
+            predictionsBuffer[i] = prediction;
 
             // Print("Prediction: ", prediction);
 
@@ -587,14 +646,19 @@ int OnCalculate(const int rates_total, const int prev_calculated, const datetime
             isNewBuySignal = isBuySignal && isDifferentSignalType;
             isNewSellSignal = isSellSignal && isDifferentSignalType;
 
-            isBullish = useKernelFilter ? (useKernelSmoothing ? isBullishSmooth : isBullishRate) : true;
-            isBearish = useKernelFilter ? (useKernelSmoothing ? isBearishSmooth : isBearishRate) : true;
-            // isBullish = true;
-            // isBearish = true;
+            // Default
+            // isBullish = useKernelFilter ? (useKernelSmoothing ? isBullishSmooth : isBullishRate) : true;
+            // isBearish = useKernelFilter ? (useKernelSmoothing ? isBearishSmooth : isBearishRate) : true;
+
+            // Overriden for debugging purposes
+            isBullish = true;
+            isBearish = true;
 
             // Entry Conditions: Booleans for ML Model Position Entries
-            startLongTrade = isNewBuySignal && isBullish && isEmaUptrend[ArraySize(isEmaUptrend) - 1] && isSmaUptrend[ArraySize(isSmaUptrend) - 1];
-            startShortTrade = isNewSellSignal && isBearish && isEmaDowntrend[ArraySize(isEmaDowntrend) - 1] && isSmaDowntrend[ArraySize(isSmaDowntrend) - 1];
+            // startLongTrade = isNewBuySignal && isBullish && isEmaUptrend[ArraySize(isEmaUptrend) - 1] && isSmaUptrend[ArraySize(isSmaUptrend) - 1];
+            //`startShortTrade = isNewSellSignal && isBearish && isEmaDowntrend[ArraySize(isEmaDowntrend) - 1] && isSmaDowntrend[ArraySize(isSmaDowntrend) - 1];
+            startLongTrade = isBuySignal;   //&& isBullish && isEmaUptrend[ArraySize(isEmaUptrend) - 1] && isSmaUptrend[ArraySize(isSmaUptrend) - 1];
+            startShortTrade = isSellSignal; // && isBearish && isEmaDowntrend[ArraySize(isEmaDowntrend) - 1] && isSmaDowntrend[ArraySize(isSmaDowntrend) - 1];
 
             // if (startLongTrade || startShortTrade)
             // {
@@ -605,23 +669,24 @@ int OnCalculate(const int rates_total, const int prev_calculated, const datetime
             // tradesShort[i] = startShortTrade ? close[i] : 0;
             if (startLongTrade)
             {
-                trades[i] = low[i] - 0.2;
+
+                trades[i] = low[i] - 5;
                 tradeColors[i] = 1;
-                // realTrades[i]= -1;
+                realTrades[i] = 1;
             }
             else if (startShortTrade)
             {
-                trades[i] = high[i] + 0.2;
+                trades[i] = high[i] + 5;
                 tradeColors[i] = 0;
-                // realTrades[i]= 1;
+                realTrades[i] = -1;
             }
             else
             {
                 trades[i] = 0;
-                //  realTrades[i]= 0;
+                realTrades[i] = 0;
             }
         }
- 
+
         //                                                                                           : iCustom(NULL, 0, "indicator_name", 0, 0); // Replace "indicator_name" with the actual name of your indicator
         // signal = signal != 0 ? signal[0] : signal[1];
     }
@@ -707,6 +772,22 @@ double zeroIfNotAvailable(double &value[], int index)
     return index >= 0 && index < ArraySize(value) ? value[index] : 0;
 }
 
+/**
+ * Removes the first position of an array and moves all the elements to the left
+ *
+ * @param array
+ * @return double
+ */
+void removeFirstPosition(double &array[])
+{
+    for (int i = 0; i < ArraySize(array) - 1; i++)
+    {
+        array[i] = array[i + 1];
+    }
+
+    array[ArraySize(array) - 1] = 0;
+}
+
 double MathSum(const double &array[])
 {
     int sizeV = ArraySize(array);
@@ -786,6 +867,11 @@ bool regime_filter(double &src[], const double &high[], const double &low[], int
     double value1 = 0.2 * (src[currentIndex] - src[currentIndex - 1]) + 0.8 * lastrRegimeFilterValue1;
     double value2 = 0.1 * (high[currentIndex] - low[currentIndex]) + 0.8 * lastrRegimeFilterValue2;
 
+    if (value2 < 0.000001)
+    {
+        value2 += 1;
+    }
+
     lastrRegimeFilterValue1 = value1;
     lastrRegimeFilterValue2 = value2;
 
@@ -814,13 +900,15 @@ int rescaleArray(const int rates_total,
                  const double newMin,
                  const double newMax,
                  const double &price[],
-                 double &buffer[])
+                 double &buffer[],
+                 bool arrayContainsHistoricData = false)
 {
     int i, j;
     double maxDifference = MathMax(oldMax - oldMin, 10e-10);
     //--- main loop
+
     for (i = prev_calculated, j = 0; i < rates_total && j < rates_total - prev_calculated && !IsStopped(); i++, j++)
-        buffer[i] = newMin + (newMax - newMin) * (price[prev_calculated == 0 ? i : j] - oldMin) / maxDifference;
+        buffer[i] = newMin + (newMax - newMin) * (price[prev_calculated == 0 || arrayContainsHistoricData ? i : j] - oldMin) / maxDifference;
 
     return (rates_total);
 }
@@ -879,6 +967,9 @@ double get_lorentzian_distance(int i, int latestFeature, int featureCountV, doub
     case 2:
         return MathLog(1 + MathAbs(f1RsiV[latestFeature] - f1RsiV[i])) +
                MathLog(1 + MathAbs(f2WTV[latestFeature] - f2WTV[i]));
+        break;
+    case 1:
+        return MathLog(1 + MathAbs(f1RsiV[latestFeature] - f1RsiV[i]));
         break;
     }
 
